@@ -6,8 +6,7 @@ struct Main {
     static func main() async throws {
         let cfg = Config.load()
 
-        let dbPath = ProcessInfo.processInfo.environment["KV_DB_PATH"]
-            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("wvhdb.sqlite").path
+        let dbPath = ProcessInfo.processInfo.environment["KV_DB_PATH"] ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("wvhdb.sqlite").path
         let maxBodyBytes = Int(ProcessInfo.processInfo.environment["KV_MAX_BODY"] ?? "5242880") ?? 5 * 1024 * 1024
         let token = ProcessInfo.processInfo.environment["KV_TOKEN"]
 

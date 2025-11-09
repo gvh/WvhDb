@@ -3,6 +3,25 @@ import HTTPTypes
 import NIOCore
 import Foundation
 
+private func bearerToken(from authorization: String) -> String? {
+    let parts = authorization.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true)
+    guard parts.count == 2, parts[0].caseInsensitiveCompare("Bearer") == .orderedSame else { return nil }
+    return String(parts[1])
+}
+
+private func isValidKeyComponent(_ s: String) -> Bool {
+    guard !s.isEmpty else { return false }
+    for ch in s {
+        if ch == "/" || ch.isNewline { return false }
+        // Reject control characters (ASCII 0x00-0x1F and 0x7F)
+        for scalar in ch.unicodeScalars {
+            let v = scalar.value
+            if (v <= 0x1F) || (v == 0x7F) { return false }
+        }
+    }
+    return true
+}
+
 struct AuthMiddleware: RouterMiddleware {
     typealias Context = BasicRequestContext
     let token: String?
@@ -13,8 +32,11 @@ struct AuthMiddleware: RouterMiddleware {
         next: (Request, BasicRequestContext) async throws -> Response
     ) async throws -> Response {
         guard let token, !token.isEmpty else { return try await next(request, context) }
-        let auth = request.headers[.authorization] ?? ""
-        guard auth == "Bearer \(token)" else { throw HTTPError(.unauthorized) }
+        guard let headerToken = bearerToken(from: request.headers[.authorization] ?? ""), headerToken == token else {
+            var error = HTTPError(.unauthorized)
+            error.headers[.wwwAuthenticate] = "Bearer"
+            throw error
+        }
         return try await next(request, context)
     }
 }
@@ -43,14 +65,21 @@ func registerRoutes(
     )
     router.middlewares.add(AuthMiddleware(token: token))
 
+    // respond to health request
     router.get("health") { (_: Request, _: BasicRequestContext) async -> String in
         "ok"
+    }
+
+    // respond to health request
+    router.get("areyouthere") { (_: Request, _: BasicRequestContext) async -> String in
+        "The reports of my death are greatly exaggerated."
     }
 
     // PUT /v1/:type/:key
     router.put("v1/:type/:key") { req, ctx in
         guard let type: String = ctx.parameters.get("type"),
               let key: String = ctx.parameters.get("key") else { throw HTTPError(.badRequest) }
+        guard isValidKeyComponent(type), isValidKeyComponent(key) else { throw HTTPError(.badRequest) }
 		
 		let buf = try await req.body.collect(upTo: maxBodyBytes)
         let data = Data(buf.readableBytesView)
@@ -64,6 +93,7 @@ func registerRoutes(
     router.get("v1/:type/:key") { req, ctx in
         guard let type: String = ctx.parameters.get("type"),
               let key: String = ctx.parameters.get("key") else { throw HTTPError(.badRequest) }
+        guard isValidKeyComponent(type), isValidKeyComponent(key) else { throw HTTPError(.badRequest) }
         
         if let data = try await store.get(type: type, key: key) {
             let allocator = ByteBufferAllocator()
@@ -71,6 +101,7 @@ func registerRoutes(
             buf.writeBytes(data)
             var resp = Response(status: .ok, body: .init(byteBuffer: buf))
             resp.headers[.contentType] = "text/csv; charset=utf-8"
+            resp.headers[.contentDisposition] = "attachment; filename=\"\(key).csv\""
             return resp
         }
         throw HTTPError(.notFound)
@@ -80,6 +111,7 @@ func registerRoutes(
     router.head("v1/:type/:key") { req, ctx in
         guard let type: String = ctx.parameters.get("type"),
               let key: String = ctx.parameters.get("key") else { throw HTTPError(.badRequest) }
+        guard isValidKeyComponent(type), isValidKeyComponent(key) else { throw HTTPError(.badRequest) }
         return try await store.exists(type: type, key: key) ? Response(status: .ok) : Response(status: .notFound)
     }
 
@@ -87,6 +119,7 @@ func registerRoutes(
     router.delete("v1/:type/:key") { req, ctx in
         guard let type: String = ctx.parameters.get("type"),
               let key: String = ctx.parameters.get("key") else { throw HTTPError(.badRequest) }
+        guard isValidKeyComponent(type), isValidKeyComponent(key) else { throw HTTPError(.badRequest) }
         try await store.delete(type: type, key: key)
         return Response(status: .noContent)
     }
@@ -94,8 +127,10 @@ func registerRoutes(
     // GET /v1/:type?prefix=...&limit=...
     router.get("v1/:type") { req, ctx in
         guard let type: String = ctx.parameters.get("type") else { throw HTTPError(.badRequest) }
+        guard isValidKeyComponent(type) else { throw HTTPError(.badRequest) }
 		let prefix: String? = queryValue("prefix", from: req)
-		let limit = min(Int(queryValue("limit", from: req) ?? "100") ?? 100, 1000)
+		let rawLimit = Int(queryValue("limit", from: req) ?? "100") ?? 100
+		let limit = min(max(rawLimit, 0), 1000)
         
         let keys = try await store.list(type: type, prefix: prefix, limit: limit)
         let data = try JSONEncoder().encode(keys)
@@ -108,3 +143,4 @@ func registerRoutes(
         return resp
     }
 }
+
