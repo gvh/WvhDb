@@ -3,6 +3,11 @@ import HTTPTypes
 import NIOCore
 import Foundation
 
+private let headerContentType = HTTPField.Name("Content-Type")!
+private let headerContentDisposition = HTTPField.Name("Content-Disposition")!
+private let headerWWWAuthenticate = HTTPField.Name("WWW-Authenticate")!
+private let headerXRequestID = HTTPField.Name("X-Request-ID")!
+
 private func bearerToken(from authorization: String) -> String? {
     let parts = authorization.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true)
     guard parts.count == 2, parts[0].caseInsensitiveCompare("Bearer") == .orderedSame else { return nil }
@@ -22,6 +27,45 @@ private func isValidKeyComponent(_ s: String) -> Bool {
     return true
 }
 
+private func queryValue(_ name: String, from req: Request) -> String? {
+    // HB2 Request stores the target in req.uri.path (which includes query).
+    // Prepend a dummy scheme/host so URLComponents can parse.
+    let raw = req.uri.path   // eg: "/v1/users?prefix=u&limit=10"
+    guard let comps = URLComponents(string: "http://local\(raw)"),
+          let items = comps.queryItems else { return nil }
+    return items.first(where: { $0.name == name })?.value
+}
+
+private func queryValues(_ name: String, from req: Request) -> [String] {
+    let raw = req.uri.path
+    guard let comps = URLComponents(string: "http://local\(raw)"),
+          let items = comps.queryItems else { return [] }
+    return items.filter { $0.name == name }.compactMap { $0.value }
+}
+
+private func requestID(from req: Request) -> String {
+    if let existing = req.headers[headerXRequestID] ?? req.headers[HTTPField.Name("x-request-id")!] {
+        let val = existing.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+        if !val.isEmpty { return val }
+    }
+    return UUID().uuidString
+}
+
+private func jsonErrorResponse(status: HTTPResponse.Status, error code: String, message: String, details: [String: String]? = nil, requestID: String? = nil) -> Response {
+    struct ErrorBody: Encodable { let error: String; let message: String; let details: [String: String]? }
+    var mergedDetails = details ?? [:]
+    if let requestID { mergedDetails["request_id"] = requestID }
+    let body = ErrorBody(error: code, message: message, details: mergedDetails.isEmpty ? nil : mergedDetails)
+    let data = (try? JSONEncoder().encode(body)) ?? Data()
+    let allocator = ByteBufferAllocator()
+    var buf = allocator.buffer(capacity: data.count)
+    buf.writeBytes(data)
+    var resp = Response(status: status, body: .init(byteBuffer: buf))
+    resp.headers[headerContentType] = "application/json; charset=utf-8"
+    if let requestID { resp.headers[headerXRequestID] = requestID }
+    return resp
+}
+
 struct AuthMiddleware: RouterMiddleware {
     typealias Context = BasicRequestContext
     let token: String?
@@ -31,23 +75,16 @@ struct AuthMiddleware: RouterMiddleware {
         context: BasicRequestContext,
         next: (Request, BasicRequestContext) async throws -> Response
     ) async throws -> Response {
+        let rid = requestID(from: request)
         guard let token, !token.isEmpty else { return try await next(request, context) }
         guard let headerToken = bearerToken(from: request.headers[.authorization] ?? ""), headerToken == token else {
-            var error = HTTPError(.unauthorized)
-            error.headers[.wwwAuthenticate] = "Bearer"
-            throw error
+            context.logger.warning("Unauthorized request", metadata: ["path": .string(request.uri.path), "request_id": .string(rid)])
+            var resp = jsonErrorResponse(status: .unauthorized, error: "unauthorized", message: "Missing or invalid bearer token.", details: nil, requestID: rid)
+            resp.headers[headerWWWAuthenticate] = "Bearer"
+            return resp
         }
         return try await next(request, context)
     }
-}
-
-private func queryValue(_ name: String, from req: Request) -> String? {
-    // HB2 Request stores the target in req.uri.path (which includes query).
-    // Prepend a dummy scheme/host so URLComponents can parse.
-    let raw = req.uri.path   // eg: "/v1/users?prefix=u&limit=10"
-    guard let comps = URLComponents(string: "http://local\(raw)"),
-          let items = comps.queryItems else { return nil }
-    return items.first(where: { $0.name == name })?.value
 }
 
 func registerRoutes(
@@ -77,70 +114,133 @@ func registerRoutes(
 
     // PUT /v1/:type/:key
     router.put("v1/:type/:key") { req, ctx in
-        guard let type: String = ctx.parameters.get("type"),
-              let key: String = ctx.parameters.get("key") else { throw HTTPError(.badRequest) }
-        guard isValidKeyComponent(type), isValidKeyComponent(key) else { throw HTTPError(.badRequest) }
+        let rid = requestID(from: req)
+        guard let type: String = ctx.parameters.get("type") else {
+            return jsonErrorResponse(status: .badRequest, error: "invalid_argument", message: "Missing type or key.", requestID: rid)
+        }
+        guard let key: String = ctx.parameters.get("key") else {
+            return jsonErrorResponse(status: .badRequest, error: "invalid_argument", message: "Missing type or key.", requestID: rid)
+        }
+        guard isValidKeyComponent(type), isValidKeyComponent(key) else {
+            return jsonErrorResponse(status: .badRequest, error: "invalid_argument", message: "Invalid type or key.", requestID: rid)
+        }
 		
 		let buf = try await req.body.collect(upTo: maxBodyBytes)
         let data = Data(buf.readableBytesView)
-        if data.isEmpty { throw HTTPError(.badRequest) }
+        if data.isEmpty {
+            return jsonErrorResponse(status: .badRequest, error: "invalid_argument", message: "Body must not be empty.", requestID: rid)
+        }
 
-        try await store.put(type: type, key: key, value: data)
+        do {
+            try await store.put(type: type, key: key, value: data)
+        } catch {
+            ctx.logger.error("PUT failed", metadata: ["type": .string(type), "key": .string(key), "request_id": .string(rid)])
+            throw error
+        }
         return Response(status: .noContent)
     }
 
     // GET /v1/:type/:key -> CSV
     router.get("v1/:type/:key") { req, ctx in
-        guard let type: String = ctx.parameters.get("type"),
-              let key: String = ctx.parameters.get("key") else { throw HTTPError(.badRequest) }
-        guard isValidKeyComponent(type), isValidKeyComponent(key) else { throw HTTPError(.badRequest) }
-        
-        if let data = try await store.get(type: type, key: key) {
-            let allocator = ByteBufferAllocator()
-            var buf = allocator.buffer(capacity: data.count)
-            buf.writeBytes(data)
-            var resp = Response(status: .ok, body: .init(byteBuffer: buf))
-            resp.headers[.contentType] = "text/csv; charset=utf-8"
-            resp.headers[.contentDisposition] = "attachment; filename=\"\(key).csv\""
-            return resp
+        let rid = requestID(from: req)
+        guard let type: String = ctx.parameters.get("type") else {
+            return jsonErrorResponse(status: .badRequest, error: "invalid_argument", message: "Missing type or key.", requestID: rid)
         }
-        throw HTTPError(.notFound)
+        guard let key: String = ctx.parameters.get("key") else {
+            return jsonErrorResponse(status: .badRequest, error: "invalid_argument", message: "Missing type or key.", requestID: rid)
+        }
+        guard isValidKeyComponent(type), isValidKeyComponent(key) else {
+            return jsonErrorResponse(status: .badRequest, error: "invalid_argument", message: "Invalid type or key.", requestID: rid)
+        }
+        
+        do {
+            if let data = try await store.get(type: type, key: key) {
+                let allocator = ByteBufferAllocator()
+                var buf = allocator.buffer(capacity: data.count)
+                buf.writeBytes(data)
+                var resp = Response(status: .ok, body: .init(byteBuffer: buf))
+                resp.headers[headerContentType] = "text/csv; charset=utf-8"
+                resp.headers[headerContentDisposition] = "attachment; filename=\"\(key).csv\""
+                return resp
+            }
+        } catch {
+            ctx.logger.error("GET failed", metadata: ["type": .string(type), "key": .string(key), "request_id": .string(rid)])
+            throw error
+        }
+        return jsonErrorResponse(status: .notFound, error: "not_found", message: "No such key.", details: ["type": type, "key": key], requestID: rid)
     }
 
     // HEAD /v1/:type/:key
     router.head("v1/:type/:key") { req, ctx in
-        guard let type: String = ctx.parameters.get("type"),
-              let key: String = ctx.parameters.get("key") else { throw HTTPError(.badRequest) }
-        guard isValidKeyComponent(type), isValidKeyComponent(key) else { throw HTTPError(.badRequest) }
-        return try await store.exists(type: type, key: key) ? Response(status: .ok) : Response(status: .notFound)
+        let rid = requestID(from: req)
+        guard let type: String = ctx.parameters.get("type") else {
+            return jsonErrorResponse(status: .badRequest, error: "invalid_argument", message: "Missing type or key.", requestID: rid)
+        }
+        guard let key: String = ctx.parameters.get("key") else {
+            return jsonErrorResponse(status: .badRequest, error: "invalid_argument", message: "Missing type or key.", requestID: rid)
+        }
+        guard isValidKeyComponent(type), isValidKeyComponent(key) else {
+            return jsonErrorResponse(status: .badRequest, error: "invalid_argument", message: "Invalid type or key.", requestID: rid)
+        }
+        do {
+            return try await store.exists(type: type, key: key) ? Response(status: .ok) : Response(status: .notFound)
+        } catch {
+            ctx.logger.error("HEAD exists check failed", metadata: ["type": .string(type), "key": .string(key), "request_id": .string(rid)])
+            throw error
+        }
     }
 
     // DELETE /v1/:type/:key
     router.delete("v1/:type/:key") { req, ctx in
-        guard let type: String = ctx.parameters.get("type"),
-              let key: String = ctx.parameters.get("key") else { throw HTTPError(.badRequest) }
-        guard isValidKeyComponent(type), isValidKeyComponent(key) else { throw HTTPError(.badRequest) }
-        try await store.delete(type: type, key: key)
-        return Response(status: .noContent)
+        let rid = requestID(from: req)
+        guard let type: String = ctx.parameters.get("type") else {
+            return jsonErrorResponse(status: .badRequest, error: "invalid_argument", message: "Missing type or key.", requestID: rid)
+        }
+        guard let key: String = ctx.parameters.get("key") else {
+            return jsonErrorResponse(status: .badRequest, error: "invalid_argument", message: "Missing type or key.", requestID: rid)
+        }
+        guard isValidKeyComponent(type), isValidKeyComponent(key) else {
+            return jsonErrorResponse(status: .badRequest, error: "invalid_argument", message: "Invalid type or key.", requestID: rid)
+        }
+        do {
+            let exists = try await store.exists(type: type, key: key)
+            if !exists {
+                return jsonErrorResponse(status: .notFound, error: "not_found", message: "No such key.", details: ["type": type, "key": key], requestID: rid)
+            }
+            try await store.delete(type: type, key: key)
+            return Response(status: .noContent)
+        } catch {
+            ctx.logger.error("DELETE failed", metadata: ["type": .string(type), "key": .string(key), "request_id": .string(rid)])
+            throw error
+        }
     }
 
     // GET /v1/:type?prefix=...&limit=...
     router.get("v1/:type") { req, ctx in
-        guard let type: String = ctx.parameters.get("type") else { throw HTTPError(.badRequest) }
-        guard isValidKeyComponent(type) else { throw HTTPError(.badRequest) }
+        let rid = requestID(from: req)
+        guard let type: String = ctx.parameters.get("type") else {
+            return jsonErrorResponse(status: .badRequest, error: "invalid_argument", message: "Missing type.", requestID: rid)
+        }
+        guard isValidKeyComponent(type) else {
+            return jsonErrorResponse(status: .badRequest, error: "invalid_argument", message: "Invalid type.", requestID: rid)
+        }
 		let prefix: String? = queryValue("prefix", from: req)
 		let rawLimit = Int(queryValue("limit", from: req) ?? "100") ?? 100
 		let limit = min(max(rawLimit, 0), 1000)
         
-        let keys = try await store.list(type: type, prefix: prefix, limit: limit)
-        let data = try JSONEncoder().encode(keys)
+        do {
+            let keys = try await store.list(type: type, prefix: prefix, limit: limit)
+            let data = try JSONEncoder().encode(keys)
 
-        let allocator = ByteBufferAllocator()
-        var buf = allocator.buffer(capacity: data.count)
-        buf.writeBytes(data)
-        var resp = Response(status: .ok, body: .init(byteBuffer: buf))
-        resp.headers[.contentType] = "application/json; charset=utf-8"
-        return resp
+            let allocator = ByteBufferAllocator()
+            var buf = allocator.buffer(capacity: data.count)
+            buf.writeBytes(data)
+            var resp = Response(status: .ok, body: .init(byteBuffer: buf))
+            resp.headers[headerContentType] = "application/json; charset=utf-8"
+            return resp
+        } catch {
+            ctx.logger.error("LIST failed", metadata: ["type": .string(type), "prefix": .string(prefix ?? ""), "limit": .string(String(limit)), "request_id": .string(rid)])
+            throw error
+        }
     }
 }
-
