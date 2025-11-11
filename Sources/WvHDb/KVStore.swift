@@ -3,30 +3,7 @@
 //
 // Created by Gardner von Holt on 9/29/25.
 //
-// Storage model:
-// - Table kv_records(record_type TEXT NOT NULL, k TEXT NOT NULL, v BLOB NOT NULL, updated_at DOUBLE NOT NULL)
-// - Primary key: (record_type, k)
-// - Index: kv_by_type(record_type) for list operations
-//
-// Operations:
-// - put(type,key,value): UPSERT with updated_at timestamp
-// - get(type,key): returns Data? (v is NOT NULL; safe unwrap)
-// - delete(type,key): deletes the row
-// - exists(type,key): SELECT EXISTS(...)
-// - list(type,prefix,limit): ordered by k, optional LIKE prefix, clamped limit
-//
-// Migrations and logging:
-// - On init(path:), open DatabaseQueue and run migrator.
-// - Log “Opening database”, “Running migrations”, and “Migrations complete” with path metadata.
-//
-// Safety and performance notes:
-// - withUnsafeData is safe because v is NOT NULL; we immediately copy into Data.
-// - Primary key covers most point lookups; kv_by_type aids list queries.
-// - Keep list limits clamped (e.g., 0…1000) to avoid heavy scans.
-//
-// Rationale:
-// - Simple, predictable schema for a KV-like store with efficient point lookups.
-// - Minimal indices for read performance without excessive write overhead.
+// See TxnLogger.swift for durable transaction logging.
 //
 
 import Foundation
@@ -35,14 +12,34 @@ import Logging
 
 actor KVStore {
     private let dbQueue: DatabaseQueue
-    private static let logger = Logger(label: "KVStore")
+    private let logger: TransactionLogging
+    private static let oslog = Logger(label: "KVStore")
 
-    init(path: String) throws {
-        Self.logger.info("Opening database", metadata: ["path": .string(path)])
-        dbQueue = try DatabaseQueue(path: path)
-        Self.logger.info("Running migrations")
-        try Self.makeMigrator().migrate(dbQueue)
-        Self.logger.info("Migrations complete")
+    init(path: String, logger: TransactionLogging? = nil) throws {
+        Self.oslog.info("Opening database", metadata: ["path": .string(path)])
+        // NOTE: Using DatabaseQueue for simplicity; can be swapped to DatabasePool for concurrent reads.
+        self.dbQueue = try DatabaseQueue(path: path)
+
+        if let logger {
+            self.logger = logger
+        } else {
+            let dbURL = URL(fileURLWithPath: path)
+            let activeLogURL = dbURL.deletingPathExtension().appendingPathExtension("txn.log")
+            self.logger = TxnLogger(activeLogURL: activeLogURL)
+        }
+
+        do {
+            Self.oslog.info("Running migrations")
+            try Self.makeMigrator().migrate(dbQueue)
+            // Log a basic schema version marker after migration. GRDB migrator doesn't expose version, so we log last migration name.
+            Self.oslog.info("Migrations complete", metadata: ["schema": .string("create_kv")])
+        } catch {
+            Self.oslog.error("Migration failed", metadata: [
+                "path": .string(path),
+                "error": .string(String(describing: error))
+            ])
+            throw error
+        }
     }
 
     private static func makeMigrator() -> DatabaseMigrator {
@@ -60,8 +57,33 @@ actor KVStore {
         return m
     }
 
+    @inline(__always)
+    private func nowTimestamp() -> TimeInterval { Date().timeIntervalSince1970 }
+
+    private func fetchValueBlob(db: Database, type: String, key: String) throws -> Data? {
+        try Row.fetchOne(
+            db,
+            sql: "SELECT v FROM kv_records WHERE record_type=? AND k=?",
+            arguments: [type, key]
+        ).flatMap { row in
+            try? row.withUnsafeData(named: "v") { data in Data(data!) }
+        }
+    }
+
+    // MARK: - Operations
+
     func put(type: String, key: String, value: Data) async throws {
         try await dbQueue.write { db in
+            let existing = try fetchValueBlob(db: db, type: type, key: key)
+            let now = self.nowTimestamp()
+            let txid = UUID().uuidString
+
+            // Log before image for updates
+            if let old = existing {
+                self.logger.logUpdateBefore(type: type, key: key, ts: now, updatedAt: now, txid: txid, value: old)
+            }
+
+            // Perform UPSERT
             try db.execute(
                 sql: """
                 INSERT INTO kv_records(record_type,k,v,updated_at)
@@ -69,15 +91,24 @@ actor KVStore {
                 ON CONFLICT(record_type,k)
                 DO UPDATE SET v=excluded.v, updated_at=excluded.updated_at
                 """,
-                arguments: [type, key, value, Date().timeIntervalSince1970]
+                arguments: [type, key, value, now]
             )
+
+            // Log after image (insert or update)
+            if existing == nil {
+                self.logger.logInsertAfter(type: type, key: key, ts: now, updatedAt: now, txid: txid, value: value)
+            } else {
+                self.logger.logUpdateAfter(type: type, key: key, ts: now, updatedAt: now, txid: txid, value: value)
+            }
         }
     }
 
     func get(type: String, key: String) async throws -> Data? {
         try await dbQueue.read { db in
-            if let row = try Row.fetchOne(db,
-                sql: "SELECT v FROM kv_records WHERE record_type=? AND k=?", arguments: [type, key]
+            if let row = try Row.fetchOne(
+                db,
+                sql: "SELECT v FROM kv_records WHERE record_type=? AND k=?",
+                arguments: [type, key]
             ) {
                 return try row.withUnsafeData(named: "v") { data in
                     Data(data!)   // safe because column is NOT NULL
@@ -89,6 +120,16 @@ actor KVStore {
 
     func delete(type: String, key: String) async throws {
         try await dbQueue.write { db in
+            let existing = try fetchValueBlob(db: db, type: type, key: key)
+            let now = self.nowTimestamp()
+            let txid = UUID().uuidString
+
+            if let old = existing {
+                self.logger.logDeleteBefore(type: type, key: key, ts: now, updatedAt: now, txid: txid, value: old)
+            } else {
+                self.logger.logDeleteBeforeMissing(type: type, key: key, ts: now, updatedAt: now, txid: txid)
+            }
+
             _ = try db.execute(
                 sql: "DELETE FROM kv_records WHERE record_type=? AND k=?",
                 arguments: [type, key]
@@ -124,3 +165,4 @@ actor KVStore {
         }
     }
 }
+

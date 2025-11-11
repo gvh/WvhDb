@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.gardnervh.wvhdb</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/local/bin/WvHDb</string>
+	</array>
+	<key>UserName</key>
+	<string>wvhdb</string>
+	<key>GroupName</key>
+	<string>wvhdb</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>KV_HOST</key>
+		<string>0.0.0.0</string>
+		<key>KV_PORT</key>
+		<string>8080</string>
+		<key>KV_DB_PATH</key>
+		<string>/usr/local/var/wvhdb/wvhdb.sqlite</string>
+		<key>KV_MAX_BODY</key>
+		<string>5242880</string>
+		<key>KV_TOKEN</key>
+		<string>changeme</string>
+		<key>LOG_PATH</key>
+		<string>/usr/local/var/log/wvhdb/app.log</string>
+		<key>LOG_MAX_SIZE_BYTES</key>
+		<string>10485760</string>
+		<key>LOG_MAX_FILES</key>
+		<string>7</string>
+		<key>LOG_LEVEL</key>
+		<string>info</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>/usr/local/var/log/wvhdb/stdout.log</string>
+	<key>StandardErrorPath</key>
+	<string>/usr/local/var/log/wvhdb/stderr.log</string>
+</dict>
+</plist>

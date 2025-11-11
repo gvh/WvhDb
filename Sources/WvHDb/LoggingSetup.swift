@@ -77,7 +77,10 @@ final class RotatingFileLogHandler: LogHandler {
             FileManager.default.createFile(atPath: fileURL.path, contents: nil)
         }
         self.handle = try? FileHandle(forWritingTo: fileURL)
-        try? self.handle?.seekToEnd()
+        _ = try? self.handle?.seekToEnd()
+        if self.handle == nil {
+            fputs("RotatingFileLogHandler failed to open \(fileURL.path) for writing. Falling back to stderr on write failures.\n", stderr)
+        }
     }
 
     var logLevel: Logger.Level {
@@ -147,7 +150,10 @@ final class RotatingFileLogHandler: LogHandler {
         // Truncate/create new base file and reopen handle
         FileManager.default.createFile(atPath: fileURL.path, contents: nil)
         self.handle = try? FileHandle(forWritingTo: fileURL)
-        try? self.handle?.seekToEnd()
+        _ = try? self.handle?.seekToEnd()
+        if self.handle == nil {
+            fputs("RotatingFileLogHandler failed to open \(fileURL.path) after rotation.\n", stderr)
+        }
         // Reset failure flag after rotation
         self.loggedWriteFailure = false
     }
@@ -159,7 +165,10 @@ final class RotatingFileLogHandler: LogHandler {
                 FileManager.default.createFile(atPath: fileURL.path, contents: nil)
             }
             handle = try? FileHandle(forWritingTo: fileURL)
-            try? handle?.seekToEnd()
+            _ = try? handle?.seekToEnd()
+            if self.handle == nil {
+                fputs("RotatingFileLogHandler failed to reopen \(fileURL.path) for writing.\n", stderr)
+            }
         }
         do {
             guard let handle = handle else { throw NSError(domain: "RotatingFileLogHandler", code: 1, userInfo: [NSLocalizedDescriptionKey: "No file handle"]) }
@@ -206,3 +215,4 @@ public enum LoggingSetup {
         }
     }
 }
+
