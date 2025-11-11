@@ -1,12 +1,48 @@
+//
+// KVStore.swift
+//
+// Created by Gardner von Holt on 9/29/25.
+//
+// Storage model:
+// - Table kv_records(record_type TEXT NOT NULL, k TEXT NOT NULL, v BLOB NOT NULL, updated_at DOUBLE NOT NULL)
+// - Primary key: (record_type, k)
+// - Index: kv_by_type(record_type) for list operations
+//
+// Operations:
+// - put(type,key,value): UPSERT with updated_at timestamp
+// - get(type,key): returns Data? (v is NOT NULL; safe unwrap)
+// - delete(type,key): deletes the row
+// - exists(type,key): SELECT EXISTS(...)
+// - list(type,prefix,limit): ordered by k, optional LIKE prefix, clamped limit
+//
+// Migrations and logging:
+// - On init(path:), open DatabaseQueue and run migrator.
+// - Log “Opening database”, “Running migrations”, and “Migrations complete” with path metadata.
+//
+// Safety and performance notes:
+// - withUnsafeData is safe because v is NOT NULL; we immediately copy into Data.
+// - Primary key covers most point lookups; kv_by_type aids list queries.
+// - Keep list limits clamped (e.g., 0…1000) to avoid heavy scans.
+//
+// Rationale:
+// - Simple, predictable schema for a KV-like store with efficient point lookups.
+// - Minimal indices for read performance without excessive write overhead.
+//
+
 import Foundation
 import GRDB
+import Logging
 
 actor KVStore {
     private let dbQueue: DatabaseQueue
+    private static let logger = Logger(label: "KVStore")
 
     init(path: String) throws {
+        Self.logger.info("Opening database", metadata: ["path": .string(path)])
         dbQueue = try DatabaseQueue(path: path)
+        Self.logger.info("Running migrations")
         try Self.makeMigrator().migrate(dbQueue)
+        Self.logger.info("Migrations complete")
     }
 
     private static func makeMigrator() -> DatabaseMigrator {
@@ -40,14 +76,14 @@ actor KVStore {
 
     func get(type: String, key: String) async throws -> Data? {
         try await dbQueue.read { db in
-		if let row = try Row.fetchOne(db,
-		    sql: "SELECT v FROM kv_records WHERE record_type=? AND k=?", arguments: [type, key]
-		) {
-    		return try row.withUnsafeData(named: "v") { data in
-        		Data(data!)   // safe because column is NOT NULL
-    		}
-		}
-		return nil
+            if let row = try Row.fetchOne(db,
+                sql: "SELECT v FROM kv_records WHERE record_type=? AND k=?", arguments: [type, key]
+            ) {
+                return try row.withUnsafeData(named: "v") { data in
+                    Data(data!)   // safe because column is NOT NULL
+                }
+            }
+            return nil
         }
     }
 

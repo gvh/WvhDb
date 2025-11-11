@@ -1,12 +1,48 @@
+//
+// Routes.swift
+//
+// Created by Gardner von Holt on 9/29/25.
+//
+// Conventions and middleware:
+// - CORS: origin-based allow-list; allow Content-Type and Authorization headers;
+//   methods: GET, PUT, DELETE, HEAD, OPTIONS.
+// - Auth: optional Bearer token. If KV_TOKEN is set and non-empty, enforce Authorization: Bearer <token>.
+//   On failure: 401 with WWW-Authenticate: Bearer, and a standard JSON error body.
+//   Never log token values; log only path and request_id.
+//
+// Request ID propagation:
+// - Accept X-Request-ID (case-insensitive). If missing, generate a UUID.
+// - Echo X-Request-ID on error responses and include in JSON error “details.request_id”.
+//
+// Parameter and input validation:
+// - Keys and types must not be empty and must not include slashes, newlines, or control characters.
+// - Body for PUT must not be empty; reject with 400 if empty.
+// - Query parsing uses URLComponents with a dummy scheme/host from req.uri.path (HB2 target).
+//
+// Response conventions:
+// - JSON: Content-Type: application/json; charset=utf-8
+// - CSV download: text/csv; charset=utf-8 and Content-Disposition: attachment; filename="<key>.csv"
+// - Status codes: PUT 204, GET 200/404, HEAD 200/404, DELETE 204/404
+// - Error schema: { error: String, message: String, details?: { ... } }
+//
+// Rationale:
+// - Consistent headers and error schema improve client integration.
+// - Defensive validation prevents path traversal and malformed input.
+// - Request ID aids correlation across logs and clients.
+//
+
 import Hummingbird
 import HTTPTypes
 import NIOCore
 import Foundation
+import Logging
 
 private let headerContentType = HTTPField.Name("Content-Type")!
 private let headerContentDisposition = HTTPField.Name("Content-Disposition")!
 private let headerWWWAuthenticate = HTTPField.Name("WWW-Authenticate")!
 private let headerXRequestID = HTTPField.Name("X-Request-ID")!
+
+private let routesLogger = Logger(label: "Routes")
 
 private func bearerToken(from authorization: String) -> String? {
     let parts = authorization.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true)
@@ -243,4 +279,9 @@ func registerRoutes(
             throw error
         }
     }
+    
+    routesLogger.info("Routes registered", metadata: [
+        "auth": .string(token == nil || token == "" ? "disabled" : "enabled"),
+        "max_body_bytes": .string(String(maxBodyBytes))
+    ])
 }
