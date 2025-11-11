@@ -1,28 +1,16 @@
-//
-//  Untitled.swift
-//  WvHDb
-//
-//  Created by Gardner von Holt on 11/11/25.
-//
-
 import Foundation
 import Testing
-@testable import WvHDb // Replace with the module that contains KVStore
+@testable import WvHDb
 
+final class NoOpTxnLogger: TransactionLogging {
+    func logUpdateBefore(type: String, key: String, ts: TimeInterval, updatedAt: TimeInterval, txid: String, value: Data) {}
+    func logUpdateAfter(type: String, key: String, ts: TimeInterval, updatedAt: TimeInterval, txid: String, value: Data) {}
+    func logInsertAfter(type: String, key: String, ts: TimeInterval, updatedAt: TimeInterval, txid: String, value: Data) {}
+    func logDeleteBefore(type: String, key: String, ts: TimeInterval, updatedAt: TimeInterval, txid: String, value: Data) {}
+    func logDeleteBeforeMissing(type: String, key: String, ts: TimeInterval, updatedAt: TimeInterval, txid: String) {}
+}
 
-// If you want to assert logging calls, use this Spy instead:
-/*
- final class SpyTxnLogger: TransactionLogging {
- private(set) var calls: [String] = []
- func logUpdateBefore(type: String, key: String, ts: TimeInterval, updatedAt: TimeInterval, txid: String, value: Data) { calls.append("update-before:\(type):\(key)") }
- func logUpdateAfter(type: String, key: String, ts: TimeInterval, updatedAt: TimeInterval, txid: String, value: Data) { calls.append("update-after:\(type):\(key)") }
- func logInsertAfter(type: String, key: String, ts: TimeInterval, updatedAt: TimeInterval, txid: String, value: Data) { calls.append("insert-after:\(type):\(key)") }
- func logDeleteBefore(type: String, key: String, ts: TimeInterval, updatedAt: TimeInterval, txid: String, value: Data) { calls.append("delete-before:\(type):\(key)") }
- func logDeleteBeforeMissing(type: String, key: String, ts: TimeInterval, updatedAt: TimeInterval, txid: String) { calls.append("delete-before-missing:\(type):\(key)") }
- }
- */
-
-@Suite("KVStore basic CRUD")
+@Suite("KVStore CRUD and query behavior")
 struct KVStoreCRUDTests {
 
     private func makeTempDBURL() throws -> URL {
@@ -32,7 +20,7 @@ struct KVStoreCRUDTests {
         return dir.appendingPathComponent("test.sqlite")
     }
 
-    @Test("Insert, Get, Exists, List, Delete happy path")
+    @Test("Insert, Get, Exists, List, Update, Delete")
     func testCRUD() async throws {
         let dbURL = try makeTempDBURL()
         let store = try KVStore(path: dbURL.path, logger: NoOpTxnLogger())
@@ -73,7 +61,7 @@ struct KVStoreCRUDTests {
         #expect(existsAfterDelete == false)
     }
 
-    @Test("List limit and prefix behavior")
+    @Test("List prefix and limit clamping")
     func testListBehavior() async throws {
         let dbURL = try makeTempDBURL()
         let store = try KVStore(path: dbURL.path, logger: NoOpTxnLogger())
@@ -94,7 +82,30 @@ struct KVStoreCRUDTests {
         let prefA = try await store.list(type: type, prefix: "a", limit: 10)
         #expect(Set(prefA) == Set(["a1", "a2"]))
 
+        // Limit clamping behavior (upper bound in code is 1000, but test a small value)
         let limited = try await store.list(type: type, prefix: (nil as String?), limit: 2)
         #expect(limited.count == 2)
+    }
+
+    @Test("Get and delete on missing keys")
+    func testMissingKeys() async throws {
+        let dbURL = try makeTempDBURL()
+        let store = try KVStore(path: dbURL.path, logger: NoOpTxnLogger())
+
+        let type = "ghosts"
+        let key = "phantom"
+
+        // Exists should be false
+        let exists = try await store.exists(type: type, key: key)
+        #expect(exists == false)
+
+        // Get should be nil
+        let fetched = try await store.get(type: type, key: key)
+        #expect(fetched == nil)
+
+        // Delete should not throw
+        try await store.delete(type: type, key: key)
+        let existsAfter = try await store.exists(type: type, key: key)
+        #expect(existsAfter == false)
     }
 }
