@@ -15,9 +15,11 @@ actor KVStore {
     private let logger: TransactionLogging
     private static let oslog = Logger(label: "KVStore")
 
+    // Single designated initializer (actor-safe in Swift 6).
+    // Allows optional injection of a TransactionLogging implementation for tests.
     init(path: String, logger: TransactionLogging? = nil) throws {
         Self.oslog.info("Opening database", metadata: ["path": .string(path)])
-        // NOTE: Using DatabaseQueue for simplicity; can be swapped to DatabasePool for concurrent reads.
+        // Using DatabaseQueue for simplicity; can be swapped to DatabasePool for concurrent reads.
         self.dbQueue = try DatabaseQueue(path: path)
 
         if let logger {
@@ -31,7 +33,7 @@ actor KVStore {
         do {
             Self.oslog.info("Running migrations")
             try Self.makeMigrator().migrate(dbQueue)
-            // Log a basic schema version marker after migration. GRDB migrator doesn't expose version, so we log last migration name.
+            // GRDB migrator doesn't expose a version; log the last migration name for reference.
             Self.oslog.info("Migrations complete", metadata: ["schema": .string("create_kv")])
         } catch {
             Self.oslog.error("Migration failed", metadata: [
@@ -57,10 +59,12 @@ actor KVStore {
         return m
     }
 
-    @inline(__always)
-    private func nowTimestamp() -> TimeInterval { Date().timeIntervalSince1970 }
+    // MARK: - Helpers (nonisolated so they can be called from GRDB closures)
 
-    private func fetchValueBlob(db: Database, type: String, key: String) throws -> Data? {
+    @inline(__always)
+    private nonisolated static func nowTimestamp() -> TimeInterval { Date().timeIntervalSince1970 }
+
+    private nonisolated static func fetchValueBlob(db: Database, type: String, key: String) throws -> Data? {
         try Row.fetchOne(
             db,
             sql: "SELECT v FROM kv_records WHERE record_type=? AND k=?",
@@ -74,8 +78,9 @@ actor KVStore {
 
     func put(type: String, key: String, value: Data) async throws {
         try await dbQueue.write { db in
-            let existing = try fetchValueBlob(db: db, type: type, key: key)
-            let now = self.nowTimestamp()
+            // Read existing to detect insert vs update
+            let existing = try Self.fetchValueBlob(db: db, type: type, key: key)
+            let now = Self.nowTimestamp()
             let txid = UUID().uuidString
 
             // Log before image for updates
@@ -120,8 +125,9 @@ actor KVStore {
 
     func delete(type: String, key: String) async throws {
         try await dbQueue.write { db in
-            let existing = try fetchValueBlob(db: db, type: type, key: key)
-            let now = self.nowTimestamp()
+            // Fetch existing value for before-image logging
+            let existing = try Self.fetchValueBlob(db: db, type: type, key: key)
+            let now = Self.nowTimestamp()
             let txid = UUID().uuidString
 
             if let old = existing {
@@ -165,4 +171,3 @@ actor KVStore {
         }
     }
 }
-
