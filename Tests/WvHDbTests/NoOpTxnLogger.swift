@@ -6,8 +6,9 @@
 //
 
 import Foundation
+@testable import WvHDb
 
-#if DEBUG
+// Simple no-op logger for tests; replace or extend with a Spy if you want assertions.
 final class NoOpTxnLogger: TransactionLogging {
     func logUpdateBefore(type: String, key: String, ts: TimeInterval, updatedAt: TimeInterval, txid: String, value: Data) {}
     func logUpdateAfter(type: String, key: String, ts: TimeInterval, updatedAt: TimeInterval, txid: String, value: Data) {}
@@ -15,4 +16,5 @@ final class NoOpTxnLogger: TransactionLogging {
     func logDeleteBefore(type: String, key: String, ts: TimeInterval, updatedAt: TimeInterval, txid: String, value: Data) {}
     func logDeleteBeforeMissing(type: String, key: String, ts: TimeInterval, updatedAt: TimeInterval, txid: String) {}
 }
-#endif
+
+
