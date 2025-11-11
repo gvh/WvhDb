@@ -150,6 +150,47 @@ struct TxnLoggerTests {
         #expect(json["key"] as? String == "missing")
     }
 
+    @Test("Delete-before includes csv and sha256 when value is present")
+    func testDeleteBeforeWithValue() throws {
+        let logURL = try makeTempLogURL()
+        let logger = TxnLogger(activeLogURL: logURL)
+        let ts = Date().timeIntervalSince1970
+
+        let payload = String(repeating: "z", count: 128)
+        let data = Data(payload.utf8)
+        logger.logDeleteBefore(type: "t", key: "del", ts: ts, updatedAt: ts, txid: "tx-del", value: data)
+
+        let lines = try readLines(at: logURL)
+        #expect(lines.count == 1)
+        let json = try #require(try JSONSerialization.jsonObject(with: Data(lines[0].utf8)) as? [String: Any])
+
+        #expect(json["op"] as? String == "delete-before")
+        #expect(json["csv"] as? String == payload)
+        #expect((json["sha256"] as? String)?.isEmpty == false)
+        #expect(json["truncated"] == nil)
+    }
+
+    @Test("Delete-before with large payload sets truncated")
+    func testDeleteBeforeTruncation() throws {
+        let logURL = try makeTempLogURL()
+        let logger = TxnLogger(activeLogURL: logURL)
+        let ts = Date().timeIntervalSince1970
+
+        // > 8KB payload to trigger truncation
+        let big = String(repeating: "q", count: 10 * 1024)
+        logger.logDeleteBefore(type: "t", key: "del-big", ts: ts, updatedAt: ts, txid: "tx-del-big", value: Data(big.utf8))
+
+        let lines = try readLines(at: logURL)
+        #expect(lines.count == 1)
+        let json = try #require(try JSONSerialization.jsonObject(with: Data(lines[0].utf8)) as? [String: Any])
+
+        #expect(json["op"] as? String == "delete-before")
+        #expect(json["truncated"] as? Bool == true)
+        let csv = json["csv"] as? String
+        #expect((csv?.utf8.count ?? 0) <= 8 * 1024)
+        #expect((json["sha256"] as? String)?.isEmpty == false)
+    }
+
     @Test("Truncation boundary: exactly 8KB and just over")
     func testTruncationBoundary() throws {
         let logURL = try makeTempLogURL()
@@ -271,13 +312,13 @@ struct TxnLoggerTests {
         do {
             let json = try #require(try JSONSerialization.jsonObject(with: Data(lines[0].utf8)) as? [String: Any])
             #expect(abs((json["ts"] as? Double ?? -1) - ts1) < 0.001)
-            #expect(abs((json["updatedAt"] as? Double ?? -1) - ts1) < 0.001)
+            #expect(abs((json["updated_at"] as? Double ?? -1) - ts1) < 0.001)
         }
         // Second line
         do {
             let json = try #require(try JSONSerialization.jsonObject(with: Data(lines[1].utf8)) as? [String: Any])
             #expect(abs((json["ts"] as? Double ?? -1) - ts2) < 0.001)
-            #expect(abs((json["updatedAt"] as? Double ?? -1) - ts2) < 0.001)
+            #expect(abs((json["updated_at"] as? Double ?? -1) - ts2) < 0.001)
         }
     }
 
@@ -360,5 +401,4 @@ struct TxnLoggerTests {
         let logs = contents.filter { $0.contains(".txn.log") }
         #expect(logs.count >= 1)
     }
-
 }
