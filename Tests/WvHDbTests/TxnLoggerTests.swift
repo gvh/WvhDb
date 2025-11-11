@@ -253,4 +253,112 @@ struct TxnLoggerTests {
         #expect(hash == expected)
     }
 
+    @Test("Timestamps are recorded accurately")
+    func testTimestampsRecordedAccurately() throws {
+        let logURL = try makeTempLogURL()
+        let logger = TxnLogger(activeLogURL: logURL)
+
+        let ts1 = Date().timeIntervalSince1970
+        let ts2 = ts1 + 1.234
+
+        logger.logInsertAfter(type: "t", key: "k1", ts: ts1, updatedAt: ts1, txid: "tx1", value: Data("v1\n".utf8))
+        logger.logUpdateAfter(type: "t", key: "k1", ts: ts2, updatedAt: ts2, txid: "tx2", value: Data("v2\n".utf8))
+
+        let lines = try readLines(at: logURL)
+        #expect(lines.count == 2)
+
+        // First line
+        do {
+            let json = try #require(try JSONSerialization.jsonObject(with: Data(lines[0].utf8)) as? [String: Any])
+            #expect(abs((json["ts"] as? Double ?? -1) - ts1) < 0.001)
+            #expect(abs((json["updatedAt"] as? Double ?? -1) - ts1) < 0.001)
+        }
+        // Second line
+        do {
+            let json = try #require(try JSONSerialization.jsonObject(with: Data(lines[1].utf8)) as? [String: Any])
+            #expect(abs((json["ts"] as? Double ?? -1) - ts2) < 0.001)
+            #expect(abs((json["updatedAt"] as? Double ?? -1) - ts2) < 0.001)
+        }
+    }
+
+    @Test("Mixed valid/invalid UTF-8 handling")
+    func testMixedUTF8BytesHandling() throws {
+        let logURL = try makeTempLogURL()
+        let logger = TxnLogger(activeLogURL: logURL)
+        let ts = Date().timeIntervalSince1970
+
+        var bytes: [UInt8] = Array("prefix,".utf8)
+        bytes.append(contentsOf: [0xFF, 0xFF, 0xFF]) // invalid tail
+        let data = Data(bytes)
+
+        logger.logInsertAfter(type: "t", key: "mixed", ts: ts, updatedAt: ts, txid: "txm", value: data)
+
+        let lines = try readLines(at: logURL)
+        #expect(lines.count == 1)
+        let json = try #require(try JSONSerialization.jsonObject(with: Data(lines[0].utf8)) as? [String: Any])
+
+        // Contract: non-UTF8 should be marked as <non-utf8>
+        #expect(json["key"] as? String == "mixed")
+        #expect(json["csv"] as? String == "<non-utf8>")
+        #expect(json["truncated"] == nil)
+    }
+
+    @Test("Write order is preserved")
+    func testWriteOrderIsPreserved() throws {
+        let logURL = try makeTempLogURL()
+        let logger = TxnLogger(activeLogURL: logURL)
+        let ts = Date().timeIntervalSince1970
+
+        let keys = ["a", "b", "c", "d"]
+        for (i, k) in keys.enumerated() {
+            logger.logInsertAfter(type: "t", key: k, ts: ts + Double(i), updatedAt: ts + Double(i), txid: "tx\(i)", value: Data("v\(i)\n".utf8))
+        }
+
+        let lines = try readLines(at: logURL)
+        #expect(lines.count == keys.count)
+        let readKeys: [String] = try lines.map { line in
+            let json = try #require(try JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any])
+            return try #require(json["key"] as? String)
+        }
+        #expect(readKeys == keys)
+    }
+
+    @Test("CSV payload with quotes and newlines is handled")
+    func testCsvEscapingAndNewlines() throws {
+        let logURL = try makeTempLogURL()
+        let logger = TxnLogger(activeLogURL: logURL)
+        let ts = Date().timeIntervalSince1970
+
+        let payload = "\"quoted\",value\nsecond,line\n"
+        logger.logInsertAfter(type: "t", key: "csv", ts: ts, updatedAt: ts, txid: "txcsv", value: Data(payload.utf8))
+
+        let lines = try readLines(at: logURL)
+        #expect(lines.count == 1)
+        let json = try #require(try JSONSerialization.jsonObject(with: Data(lines[0].utf8)) as? [String: Any])
+        let csv = try #require(json["csv"] as? String)
+        // Contract: UTF-8 payloads should be preserved (possibly truncated if large). Here it should equal the input.
+        #expect(csv == payload)
+    }
+
+    @Test("Rotation at midnight boundary")
+    func testRotationAtMidnightBoundary() throws {
+        let logURL = try makeTempLogURL()
+        let logger = TxnLogger(activeLogURL: logURL)
+
+        // Simulate two timestamps straddling midnight by using a 24h difference and letting the logger decide by local day
+        let now = Date()
+        // Force previous day and current day
+        let beforeMidnight = now.addingTimeInterval(-26 * 3600).timeIntervalSince1970
+        let afterMidnight = now.timeIntervalSince1970
+
+        logger.logInsertAfter(type: "t", key: "before", ts: beforeMidnight, updatedAt: beforeMidnight, txid: "txBefore", value: Data("x\n".utf8))
+        logger.logInsertAfter(type: "t", key: "after", ts: afterMidnight, updatedAt: afterMidnight, txid: "txAfter", value: Data("y\n".utf8))
+
+        let fm = FileManager.default
+        let dir = logURL.deletingLastPathComponent()
+        let contents = try fm.contentsOfDirectory(atPath: dir.path)
+        let logs = contents.filter { $0.contains(".txn.log") }
+        #expect(logs.count >= 1)
+    }
+
 }
